@@ -1,216 +1,170 @@
-from __future__ import annotations
-import os, math
-import datetime as dt
-from dataclasses import dataclass
-from typing import Dict, Tuple, Optional, Literal
-
-import pandas as pd
 import numpy as np
+import pandas as pd
+from typing import Dict, Tuple, Optional
+from polygon_client import fetch_daily
+from narrator import humanize
 
-from utils.polygon_client import fetch_daily
+# ---------- утилиты теханализа ----------
 
-# --------- Config / Types
-
-Horizon = Literal["short","mid","long"]
-
-class StrategyError(RuntimeError):
-    pass
-
-@dataclass
-class Decision:
-    stance: Literal["BUY","SHORT","WAIT"]
-    entry: Optional[Tuple[float,float]]  # (low, high) zone or None
-    target1: Optional[float]
-    target2: Optional[float]
-    stop: Optional[float]
-    meta: Dict
-
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/period, adjust=False).mean()
-    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/period, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr = np.maximum(df["high"]-df["low"], np.maximum(abs(df["high"]-prev_close), abs(df["low"]-prev_close)))
-    atr = pd.Series(tr).ewm(alpha=1/period, adjust=False).mean()
-    return atr
-
-def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    ha = pd.DataFrame(index=df.index)
-    ha["close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
-    ha["open"] = 0.0
-    ha.iloc[0, ha.columns.get_loc("open")] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2.0
-    for i in range(1, len(ha)):
-        ha.iloc[i, ha.columns.get_loc("open")] = (ha["open"].iloc[i-1] + ha["close"].iloc[i-1]) / 2.0
-    ha["green"] = ha["close"] > ha["open"]
+def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    ha = pd.DataFrame(index=df.index, columns=["ha_open","ha_high","ha_low","ha_close"], dtype=float)
+    ha["ha_close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
+    ha["ha_open"] = np.nan
+    # старт
+    ha.iloc[0, ha.columns.get_loc("ha_open")] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2.0
+    # рекурсия
+    for i in range(1, len(df)):
+        ha.iat[i, 0] = (ha.iat[i-1, 0] + ha.iat[i-1, 3]) / 2.0  # ha_open
+    ha["ha_high"] = df[["high", "open", "close"]].max(axis=1)
+    ha["ha_low"]  = df[["low",  "open", "close"]].min(axis=1)
     return ha
 
-def _macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
-    ema_fast = _ema(close, fast)
-    ema_slow = _ema(close, slow)
+def macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd = ema_fast - ema_slow
-    sig = _ema(macd, signal)
-    hist = macd - sig
-    return hist
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    return macd - sig
 
-def _streak_bool(series_bool: pd.Series) -> int:
-    """Length of the last True/False streak (by sign)."""
-    if len(series_bool) == 0:
-        return 0
-    last = series_bool.iloc[-1]
-    cnt = 1
-    for val in reversed(series_bool.iloc[:-1]):
-        if val == last:
-            cnt += 1
+def atr(df: pd.DataFrame, n=14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
+
+# ---------- пивоты (Fibonacci) с прошлого периода ----------
+def fib_pivots(h, l, c) -> Dict[str, float]:
+    p = (h + l + c) / 3.0
+    rng = (h - l)
+    r1 = p + 0.382 * rng
+    r2 = p + 0.618 * rng
+    r3 = p + 1.000 * rng
+    s1 = p - 0.382 * rng
+    s2 = p - 0.618 * rng
+    s3 = p - 1.000 * rng
+    return {"P": p, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3}
+
+def previous_period_pivots(df: pd.DataFrame, horizon: str) -> Dict[str,float]:
+    last = df.index.max()
+    if horizon == "short":
+        # прошлая календарная неделя
+        wk = (last - pd.offsets.Week(weekday=0)).normalize()  # понедельник текущей
+        prev_week_end = wk - pd.Timedelta(days=1)
+        prev_week_start = prev_week_end - pd.Timedelta(days=6)
+        seg = df.loc[(df.index.date >= prev_week_start.date()) & (df.index.date <= prev_week_end.date())]
+    elif horizon == "mid":
+        # прошлый календарный месяц
+        first_cur = last.replace(day=1)
+        prev_end = first_cur - pd.Timedelta(days=1)
+        prev_start = prev_end.replace(day=1)
+        seg = df.loc[(df.index.date >= prev_start.date()) & (df.index.date <= prev_end.date())]
+    else:
+        # прошлый календарный год
+        prev_year = (last.year - 1)
+        seg = df[df.index.year == prev_year]
+
+    if seg.empty:
+        # fallback: возьмём последние 20 дней
+        seg = df.tail(20)
+    h, l, c = seg["high"].max(), seg["low"].min(), seg["close"].iloc[-1]
+    return fib_pivots(h, l, c)
+
+# ---------- решение по стратегии ----------
+def decide(price: float, piv: Dict[str,float], ctx: Dict, horizon: str) -> Tuple[Dict, Dict]:
+    """
+    Возвращает (base, alt) — каждый: dict(stence, entry:(lo,hi), t1, t2, stop)
+    Логика:
+      • У крыши (>=R2) при «усталости» — базово WAIT; альтернатива SHORT от R2/R3.
+      • У дна (<=S2) — базово BUY от S2/S3.
+      • В середине — WAIT, альтернатива малым объёмом к P/R1 или P/S1.
+    """
+    # контекст
+    fatigue = ctx["fatigue"]       # True/False по MACD/HA
+    a = ctx["atr"]
+    tol = {"short":0.006, "mid":0.010, "long":0.012}[horizon]  # допуск ~0.6%…1.2%
+
+    def plan(stance, entry=None, t1=None, t2=None, stop=None):
+        return {"stance": stance, "entry": entry, "t1": t1, "t2": t2, "stop": stop}
+
+    # 1) Верхняя зона
+    if price >= piv["R2"]*(1 - tol):
+        if fatigue:
+            # альт: шорт от R2/R3
+            entry_lo = max(price, piv["R2"]*0.999)
+            entry_hi = max(entry_lo, piv["R3"])
+            alt = plan("SHORT", (entry_lo, entry_hi), t1=piv["R2"], t2=piv["P"], stop=piv["R3"] + 0.8*a)
+            base = plan("WAIT")
+            return base, alt
         else:
-            break
-    return cnt if last else -cnt
+            # импульс свежий — ничего не ловим
+            return plan("WAIT"), plan("SHORT", (piv["R2"], piv["R3"]), t1=piv["R2"], t2=piv["P"], stop=piv["R3"] + 0.8*a)
 
-def _fib_pivots(prev_high: float, prev_low: float, prev_close: float) -> Dict[str,float]:
-    rng = prev_high - prev_low
-    P = (prev_high + prev_low + prev_close) / 3.0
-    R1 = P + 0.382*rng
-    R2 = P + 0.618*rng
-    R3 = P + 1.000*rng
-    S1 = P - 0.382*rng
-    S2 = P - 0.618*rng
-    S3 = P - 1.000*rng
-    return {"P":P,"R1":R1,"R2":R2,"R3":R3,"S1":S1,"S2":S2,"S3":S3}
+    # 2) Нижняя зона
+    if price <= piv["S2"]*(1 + tol):
+        entry_hi = min(price, piv["S2"]*1.001)
+        entry_lo = min(entry_hi, piv["S3"])
+        base = plan("BUY", (entry_lo, entry_hi), t1=piv["P"], t2=piv["R1"], stop=piv["S3"] - 0.8*a)
+        alt = plan("WAIT")
+        return base, alt
 
-def _period_bounds(h: Horizon, last_date: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
-    # Use previous complete period
-    if h == "short":
-        # previous ISO week (Mon..Fri range inferred from dailies)
-        end = (last_date - pd.Timedelta(days=last_date.weekday()+1))  # last Sunday
-        start = end - pd.Timedelta(days=6)
-        return pd.Timestamp(start.date()), pd.Timestamp(end.date()), "week"
-    if h == "mid":
-        first_of_this_month = last_date.replace(day=1)
-        end = first_of_this_month - pd.Timedelta(days=1)
-        start = end.replace(day=1)
-        return pd.Timestamp(start.date()), pd.Timestamp(end.date()), "month"
-    # long
-    first_of_this_year = last_date.replace(month=1, day=1)
-    end = first_of_this_year - pd.Timedelta(days=1)
-    start = end.replace(month=1, day=1)
-    return pd.Timestamp(start.date()), pd.Timestamp(end.date()), "year"
+    # 3) Середина — предпочтение WAIT, можно аккуратно от P
+    base = plan("WAIT")
+    if price < piv["P"]:
+        # вверх к R1
+        alt = plan("BUY", (min(price, piv["P"]), piv["R1"]), t1=piv["R1"], t2=piv["R2"], stop=piv["S1"] - 0.8*a)
+    else:
+        # вниз к S1
+        alt = plan("SHORT", (max(price, piv["P"]), piv["S1"]), t1=piv["P"], t2=piv["S1"], stop=piv["R1"] + 0.8*a)
+    return base, alt
 
-def analyze_ticker(ticker: str, horizon: Horizon, for_diagnostics: bool=False) -> Dict:
-    if not ticker:
-        raise StrategyError("Тикер не указан.")
-    # fetch recent dailies
-    days = 420 if horizon != "long" else 900
-    df = fetch_daily(ticker, days=days)
-    if df is None or df.empty:
-        raise StrategyError("Не удалось загрузить свечи с Polygon.")
-    df = df.sort_values("date").reset_index(drop=True)
-    last_close = float(df["close"].iloc[-1])
-    last_date = pd.to_datetime(df["date"].iloc[-1])
+def _context(df: pd.DataFrame) -> Dict:
+    # последние 120 баров для индикаторов
+    tail = df.tail(120).copy()
+    ha = heikin_ashi(tail)
+    hist = macd_hist(tail["close"])
+    atr14 = atr(tail)
+    # «усталость»: длинная серия HA и/или затухание гистограммы
+    ha_green = (ha["ha_close"].diff() > 0).astype(int)
+    ha_red   = (ha["ha_close"].diff() < 0).astype(int)
+    # макс длина последних одноцветных
+    def max_streak(bs):
+        s, best = 0, 0
+        for v in bs[::-1]:
+            if v: s += 1; best = max(best, s)
+            else: break
+        return best
+    green_streak = max_streak(list(ha_green.values))
+    red_streak   = max_streak(list(ha_red.values))
+    # замедление MACD: последние 4 бара по модулю уменьшаются
+    h = hist.dropna().tail(6).values
+    slowing_up = len(h)>=4 and all(abs(h[-i]) < abs(h[-i-1]) for i in range(1,4))
+    fatigue = (green_streak >= 5 or red_streak >= 5) or slowing_up
 
-    # indicators
-    ha = _heikin_ashi(df)
-    ha_streak = _streak_bool(ha["green"])
-    macd_h = _macd_hist(df["close"])
-    macd_sign = macd_h > 0
-    macd_streak = _streak_bool(macd_sign)
-    rsi_val = float(_rsi(df["close"]).iloc[-1])
-    atr_val = float(_atr(df).iloc[-1])
-
-    # thresholds
-    ha_need = {"short":4, "mid":5, "long":6}[horizon]
-    macd_need = {"short":4, "mid":6, "long":8}[horizon]
-    tol = {"short":0.008, "mid":0.010, "long":0.012}[horizon]
-
-    # pivots by previous period
-    start, end, pframe = _period_bounds(horizon, pd.to_datetime(df["date"].iloc[-1]))
-    prev = df[(pd.to_datetime(df["date"])>=start)&(pd.to_datetime(df["date"])<=end)]
-    if prev.empty:
-        # fallback: take last N bars approximating period
-        fallback_n = {"week":5,"month":21,"year":252}[pframe]
-        prev = df.tail(fallback_n)
-    piv = _fib_pivots(prev["high"].max(), prev["low"].min(), prev["close"].iloc[-1])
-
-    # helper for proximity
-    def near(level: float) -> bool:
-        return abs(last_close - level)/max(1e-6, level) <= tol
-
-    # Overheat near roof (R2/R3) OR Oversold near floor (S2/S3)
-    near_R2 = near(piv["R2"]) or last_close > piv["R2"]
-    near_R3 = near(piv["R3"]) or last_close > piv["R3"]
-    near_S2 = near(piv["S2"]) or last_close < piv["S2"]
-    near_S3 = near(piv["S3"]) or last_close < piv["S3"]
-
-    long_zone = (near_S2 or near_S3) and (ha_streak <= -ha_need or macd_streak <= -macd_need)
-    short_zone = (near_R2 or near_R3) and (ha_streak >= ha_need or macd_streak >= macd_need)
-
-    meta = {
-        "price": last_close,
-        "last_date": str(last_date.date()),
-        "piv_frame": pframe,
-        "ha_streak": int(ha_streak),
-        "macd_streak": int(macd_streak),
-        "rsi": float(rsi_val),
-        "atr": float(atr_val),
-        "near_level": "R3" if near_R3 else ("R2" if near_R2 else ("S3" if near_S3 else ("S2" if near_S2 else "None"))),
+    return {
+        "fatigue": bool(fatigue),
+        "atr": float(atr14.dropna().iloc[-1])
     }
 
-    # default decision
-    stance = "WAIT"
-    entry = None
-    t1 = t2 = stp = None
+def analyze_ticker(ticker: str, horizon: str) -> Dict:
+    df = fetch_daily(ticker, days=560)
+    df = df.dropna().copy()
 
-    if short_zone:
-        if near_R3:
-            stance = "SHORT"
-            entry = (piv["R3"]*(1-0.003), piv["R3"]*(1+0.003))
-            t1 = piv["R2"]
-            t2 = piv["P"]
-            stp = piv["R3"]*(1+1.2*tol)
-        else:
-            stance = "SHORT"
-            entry = (piv["R2"]*(1-0.004), piv["R2"]*(1+0.004))
-            t1 = (piv["P"] + piv["S1"])/2.0
-            t2 = piv["S1"]
-            stp = piv["R2"]*(1+1.5*tol)
+    piv = previous_period_pivots(df, horizon)
+    price = float(df["close"].iloc[-1])
+    ctx = _context(df)
 
-    elif long_zone:
-        if near_S3:
-            stance = "BUY"
-            entry = (piv["S3"]*(1-0.003), piv["S3"]*(1+0.003))
-            t1 = piv["S2"]
-            t2 = piv["P"]
-            stp = piv["S3"]*(1-1.2*tol)
-        else:
-            stance = "BUY"
-            entry = (piv["S2"]*(1-0.004), piv["S2"]*(1+0.004))
-            t1 = (piv["P"] + piv["R1"])/2.0
-            t2 = piv["R1"]
-            stp = piv["S2"]*(1-1.5*tol)
-    else:
-        stance = "WAIT"
-        # optional "alternative" entry near mid supports
-        if last_close < piv["P"]:
-            entry = (piv["S1"]*(1-0.004), piv["S1"]*(1+0.004))
-            t1 = piv["P"]
-            t2 = piv["R1"]
-            stp = piv["S2"]*(1-1.2*tol)
-        else:
-            entry = (piv["R1"]*(1-0.004), piv["R1"]*(1+0.004))
-            t1 = piv["P"]
-            t2 = piv["S1"]
-            stp = piv["R2"]*(1+1.2*tol)
+    base, alt = decide(price, piv, ctx, horizon)
 
-    dec = Decision(stance=stance, entry=entry, target1=t1, target2=t2, stop=stp, meta=meta)
-    if for_diagnostics:
-        return dec.__dict__
-    # hide internal numbers from main text (they remain in diagnostics expander)
-    return dec.__dict__
+    # человеко-читаемый текст
+    text, alt_text = humanize(ticker, price, horizon, base, alt)
+
+    return {
+        "price": price,
+        "horizon": horizon,
+        "base": base,
+        "alt": alt,
+        "text": text,
+        "alt_text": alt_text
+    }
