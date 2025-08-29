@@ -1,46 +1,46 @@
-import os, datetime as dt
-from typing import Optional
+import os
+import datetime as dt
 import requests
 import pandas as pd
 
+API = os.getenv("POLYGON_API_KEY", "").strip()
 BASE = "https://api.polygon.io"
-API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 
-class PolygonError(RuntimeError):
-    pass
+def _normalize_ticker(t: str) -> str:
+    t = t.upper().strip()
+    # поддержка «BTCUSD» как «X:BTCUSD»
+    if t.endswith("USD") and not t.startswith("X:") and len(t) > 3:
+        return "X:" + t
+    return t
 
-def _agg_url(ticker: str) -> str:
-    # Crypto pairs must start with X:
-    if ":" in ticker:
-        return f"{BASE}/v2/aggs/ticker/{ticker}/range/1/day/{{start}}/{{end}}"
-    else:
-        return f"{BASE}/v2/aggs/ticker/{ticker}/range/1/day/{{start}}/{{end}}"
+def fetch_daily(ticker: str, days: int = 520) -> pd.DataFrame:
+    if not API:
+        raise RuntimeError("POLYGON_API_KEY отсутствует (задай в Secrets/ENV).")
+    t = _normalize_ticker(ticker)
+    end = dt.date.today()
+    start = end - dt.timedelta(days=days + 10)
 
-def fetch_daily(ticker: str, days: int = 420) -> Optional[pd.DataFrame]:
-    if not API_KEY:
-        raise PolygonError("POLYGON_API_KEY отсутствует в окружении.")
-    end = dt.datetime.utcnow().date()
-    start = end - dt.timedelta(days=days+5)
-    url = _agg_url(ticker).format(start=start.isoformat(), end=end.isoformat())
-    params = {"adjusted":"true", "apiKey": API_KEY, "limit": 50000}
-    r = requests.get(url, params=params, timeout=30)
-    if r.status_code == 429:
-        raise PolygonError("Polygon вернул 429 (rate limit). Попробуй через минуту.")
+    url = f"{BASE}/v2/aggs/ticker/{t}/range/1/day/{start}/{end}"
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": API}
+    r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    results = data.get("results") or []
-    if not results:
-        raise PolygonError("Polygon не вернул свечи (results пуст).")
+    js = r.json()
+    if not js or "results" not in js or not js["results"]:
+        raise RuntimeError("Polygon не вернул данные.")
+
     rows = []
-    for it in results:
-        ts = dt.datetime.utcfromtimestamp(it["t"]/1000).date().isoformat()
-        rows.append({
-            "date": ts,
-            "open": float(it["o"]),
-            "high": float(it["h"]),
-            "low": float(it["l"]),
-            "close": float(it["c"]),
-            "volume": float(it.get("v", 0.0)),
-        })
-    df = pd.DataFrame(rows).drop_duplicates(subset=["date"]).reset_index(drop=True)
+    for o in js["results"]:
+        rows.append(
+            {
+                "date": dt.datetime.utcfromtimestamp(o["t"]/1000).date(),
+                "open": float(o["o"]),
+                "high": float(o["h"]),
+                "low":  float(o["l"]),
+                "close":float(o["c"]),
+                "volume": float(o.get("v", 0.0)),
+            }
+        )
+    df = pd.DataFrame(rows).sort_values("date")
+    df = df.set_index(pd.to_datetime(df["date"]))
+    df = df.drop(columns=["date"])
     return df
