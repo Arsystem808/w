@@ -8,7 +8,6 @@ BASE = "https://api.polygon.io"
 
 def _normalize_ticker(t: str) -> str:
     t = t.upper().strip()
-    # поддержка «BTCUSD» как «X:BTCUSD»
     if t.endswith("USD") and not t.startswith("X:") and len(t) > 3:
         return "X:" + t
     return t
